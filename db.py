@@ -49,6 +49,26 @@ def init_db():
             PRIMARY KEY (telegram_user_id, alert_type)
         )
     """)
+    # Pairs each user wants scanned for opportunities.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            telegram_user_id INTEGER NOT NULL,
+            pair TEXT NOT NULL,
+            added_at TEXT NOT NULL,
+            PRIMARY KEY (telegram_user_id, pair)
+        )
+    """)
+    # Tracks the last candle we already alerted a user about for a given
+    # pair+signal, so we don't spam the same setup every hour.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS scan_alerts_sent (
+            telegram_user_id INTEGER NOT NULL,
+            pair TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            last_candle_time TEXT NOT NULL,
+            PRIMARY KEY (telegram_user_id, pair, signal_type)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -175,3 +195,86 @@ def get_stats(user_id: int, since: str = None):
         "avg_rr": avg_rr,
         "avg_confidence": avg_confidence,
     }
+
+
+
+# ---------- watchlist ----------
+
+def add_to_watchlist(user_id: int, pair: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR IGNORE INTO watchlist (telegram_user_id, pair, added_at)
+        VALUES (?, ?, ?)
+    """, (user_id, pair.upper(), datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def remove_from_watchlist(user_id: int, pair: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        DELETE FROM watchlist WHERE telegram_user_id = ? AND pair = ?
+    """, (user_id, pair.upper()))
+    conn.commit()
+    conn.close()
+
+
+def get_watchlist(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT pair FROM watchlist WHERE telegram_user_id = ? ORDER BY pair
+    """, (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+def get_all_watchlist_pairs():
+    """Every unique pair being watched by anyone — used to fetch each pair's data only once per scan."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT pair FROM watchlist")
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+def get_users_watching(pair: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT telegram_user_id FROM watchlist WHERE pair = ?
+    """, (pair.upper(),))
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+# ---------- scan alert dedupe ----------
+
+def already_alerted(user_id: int, pair: str, signal_type: str, candle_time: str) -> bool:
+    """Checks if we've already alerted this user about this exact candle's signal."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT last_candle_time FROM scan_alerts_sent
+        WHERE telegram_user_id = ? AND pair = ? AND signal_type = ?
+    """, (user_id, pair.upper(), signal_type))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None and row[0] == candle_time
+
+
+def mark_alerted(user_id: int, pair: str, signal_type: str, candle_time: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO scan_alerts_sent (telegram_user_id, pair, signal_type, last_candle_time)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(telegram_user_id, pair, signal_type) DO UPDATE SET last_candle_time = excluded.last_candle_time
+    """, (user_id, pair.upper(), signal_type, candle_time))
+    conn.commit()
+    conn.close()
