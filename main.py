@@ -452,7 +452,10 @@ def main():
     from datetime import time
     app.job_queue.run_daily(send_weekly_reports, time=time(hour=20, minute=0), days=(6,))  # Sunday
     app.job_queue.run_daily(send_monthly_reports, time=time(hour=20, minute=5))  # checks for the 1st internally
-    app.job_queue.run_repeating(run_watchlist_scan, interval=14400, first=60)  # every 4 hours, first run 60s after startup
+    # Scan at fixed 4H candle-close times (UTC), not just "every 4 hours from
+    # startup" — this keeps it aligned with when new 4H candles actually close.
+    for hour in (0, 4, 8, 12, 16, 20):
+        app.job_queue.run_daily(run_watchlist_scan, time=time(hour=hour, minute=2))
 
     logger.info("Bot starting...")
     app.run_polling()
