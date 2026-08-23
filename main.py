@@ -376,9 +376,9 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def run_watchlist_scan(context: ContextTypes.DEFAULT_TYPE):
     """
-    Runs hourly. Fetches each unique watched pair ONCE (not per user, to save
-    API calls), scans it for setups, and notifies every user watching that
-    pair who hasn't already been alerted for this exact candle.
+    Runs at each 4H candle close. Fetches each unique watched pair ONCE (not
+    per user, to save API calls), scans it for setups, and notifies every
+    user watching that pair who hasn't already been alerted for this exact candle.
     """
     pairs = db.get_all_watchlist_pairs()
 
@@ -452,10 +452,11 @@ def main():
     from datetime import time
     app.job_queue.run_daily(send_weekly_reports, time=time(hour=20, minute=0), days=(6,))  # Sunday
     app.job_queue.run_daily(send_monthly_reports, time=time(hour=20, minute=5))  # checks for the 1st internally
-    # Scan at fixed 4H candle-close times (UTC), not just "every 4 hours from
-    # startup" — this keeps it aligned with when new 4H candles actually close.
-    for hour in (0, 4, 8, 12, 16, 20):
-        app.job_queue.run_daily(run_watchlist_scan, time=time(hour=hour, minute=2))
+    # Scan at fixed 4H candle-close times, starting from forex market open.
+    # 23:00 in Nigeria (WAT, UTC+1) = 22:00 UTC — the schedule below starts
+    # there and repeats every 4 hours: 22:00, 02:00, 06:00, 10:00, 14:00, 18:00 UTC.
+    for hour in (22, 2, 6, 10, 14, 18):
+        app.job_queue.run_daily(run_watchlist_scan, time=time(hour=hour, minute=1))
 
     logger.info("Bot starting...")
     app.run_polling()
