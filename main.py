@@ -12,6 +12,8 @@ from telegram.ext import (
 )
 
 import db
+import twelvedata_client
+import scanner
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
@@ -42,6 +44,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/weekly — see this week's performance\n"
         "/monthly — see this month's performance\n"
         "/mute — turn specific automatic messages on/off\n"
+        "/watchlist — manage pairs you want scanned for setups\n"
         "/cancel — cancel a /log in progress\n"
         "/ping — check the bot is running\n\n"
         "You'll also get automatic weekly (Sunday) and monthly reports — "
@@ -249,6 +252,7 @@ async def monthly(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ALERT_TYPES = [
     ("weekly_report", "Weekly Report"),
     ("monthly_report", "Monthly Report"),
+    ("watchlist_scan", "Watchlist Opportunity Alerts"),
 ]
 
 
@@ -327,6 +331,92 @@ async def send_monthly_reports(context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Failed to send monthly report to {user_id}: {e}")
 
 
+# ---------- watchlist commands ----------
+
+async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /watchlist — show your current list
+    /watchlist add PAIR — add a pair
+    /watchlist remove PAIR — remove a pair
+    """
+    args = context.args
+    user_id = update.effective_user.id
+
+    if not args:
+        pairs = db.get_watchlist(user_id)
+        if not pairs:
+            await update.message.reply_text(
+                "Your watchlist is empty.\nAdd a pair: /watchlist add EURUSD"
+            )
+            return
+        await update.message.reply_text(
+            "Your watchlist:\n" + "\n".join(pairs) +
+            "\n\nRemove one: /watchlist remove PAIR"
+        )
+        return
+
+    action = args[0].lower()
+    if action == "add" and len(args) == 2:
+        pair = args[1].upper()
+        db.add_to_watchlist(user_id, pair)
+        await update.message.reply_text(f"Added {pair} to your watchlist. Scanned hourly.")
+    elif action == "remove" and len(args) == 2:
+        pair = args[1].upper()
+        db.remove_from_watchlist(user_id, pair)
+        await update.message.reply_text(f"Removed {pair} from your watchlist.")
+    else:
+        await update.message.reply_text(
+            "Usage:\n/watchlist — show your list\n"
+            "/watchlist add PAIR — e.g. /watchlist add EURUSD\n"
+            "/watchlist remove PAIR"
+        )
+
+
+# ---------- watchlist scan job ----------
+
+async def run_watchlist_scan(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs hourly. Fetches each unique watched pair ONCE (not per user, to save
+    API calls), scans it for setups, and notifies every user watching that
+    pair who hasn't already been alerted for this exact candle.
+    """
+    pairs = db.get_all_watchlist_pairs()
+
+    for pair in pairs:
+        candles = twelvedata_client.fetch_candles(pair, interval="1h", outputsize=60)
+        if not candles:
+            logger.warning(f"Watchlist scan: no data for {pair}")
+            continue
+
+        signals = scanner.scan(candles)
+        if not signals:
+            continue
+
+        last_candle_time = candles[-1]["datetime"]
+        watchers = db.get_users_watching(pair)
+
+        for user_id in watchers:
+            if not db.is_alert_enabled(user_id, "watchlist_scan"):
+                continue
+
+            new_signals = [
+                (sig_type, msg) for sig_type, msg in signals
+                if not db.already_alerted(user_id, pair, sig_type, last_candle_time)
+            ]
+            if not new_signals:
+                continue
+
+            lines = [f"👀 Hey, you should check {pair} (1H) —"]
+            for sig_type, msg in new_signals:
+                lines.append(f"• {msg}")
+                db.mark_alerted(user_id, pair, sig_type, last_candle_time)
+
+            try:
+                await context.bot.send_message(chat_id=user_id, text="\n".join(lines))
+            except Exception as e:
+                logger.warning(f"Failed to send watchlist alert to {user_id}: {e}")
+
+
 def main():
     db.init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -354,6 +444,7 @@ def main():
     app.add_handler(CommandHandler("monthly", monthly))
     app.add_handler(CommandHandler("mute", mute_menu))
     app.add_handler(CallbackQueryHandler(toggle_alert, pattern="^mute:"))
+    app.add_handler(CommandHandler("watchlist", watchlist_command))
 
     # Schedule automatic reports.
     # Times are in UTC — adjust the `time=` values below if you want them
@@ -361,6 +452,7 @@ def main():
     from datetime import time
     app.job_queue.run_daily(send_weekly_reports, time=time(hour=20, minute=0), days=(6,))  # Sunday
     app.job_queue.run_daily(send_monthly_reports, time=time(hour=20, minute=5))  # checks for the 1st internally
+    app.job_queue.run_repeating(run_watchlist_scan, interval=3600, first=60)  # every hour, first run 60s after startup
 
     logger.info("Bot starting...")
     app.run_polling()
