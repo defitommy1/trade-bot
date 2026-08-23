@@ -359,7 +359,7 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "add" and len(args) == 2:
         pair = args[1].upper()
         db.add_to_watchlist(user_id, pair)
-        await update.message.reply_text(f"Added {pair} to your watchlist. Scanned hourly.")
+        await update.message.reply_text(f"Added {pair} to your watchlist. Scanned every 4 hours.")
     elif action == "remove" and len(args) == 2:
         pair = args[1].upper()
         db.remove_from_watchlist(user_id, pair)
@@ -383,7 +383,7 @@ async def run_watchlist_scan(context: ContextTypes.DEFAULT_TYPE):
     pairs = db.get_all_watchlist_pairs()
 
     for pair in pairs:
-        candles = twelvedata_client.fetch_candles(pair, interval="1h", outputsize=60)
+        candles = twelvedata_client.fetch_candles(pair, interval="4h", outputsize=60)
         if not candles:
             logger.warning(f"Watchlist scan: no data for {pair}")
             continue
@@ -406,7 +406,7 @@ async def run_watchlist_scan(context: ContextTypes.DEFAULT_TYPE):
             if not new_signals:
                 continue
 
-            lines = [f"👀 Hey, you should check {pair} (1H) —"]
+            lines = [f"👀 Hey, you should check {pair} (4H) —"]
             for sig_type, msg in new_signals:
                 lines.append(f"• {msg}")
                 db.mark_alerted(user_id, pair, sig_type, last_candle_time)
@@ -452,7 +452,7 @@ def main():
     from datetime import time
     app.job_queue.run_daily(send_weekly_reports, time=time(hour=20, minute=0), days=(6,))  # Sunday
     app.job_queue.run_daily(send_monthly_reports, time=time(hour=20, minute=5))  # checks for the 1st internally
-    app.job_queue.run_repeating(run_watchlist_scan, interval=3600, first=60)  # every hour, first run 60s after startup
+    app.job_queue.run_repeating(run_watchlist_scan, interval=14400, first=60)  # every 4 hours, first run 60s after startup
 
     logger.info("Bot starting...")
     app.run_polling()
