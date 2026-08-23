@@ -15,7 +15,7 @@ DB_PATH = os.environ.get("DB_PATH", "trades.db")
 
 
 def init_db():
-    """Creates the trades table if it doesn't already exist. Call once on startup."""
+    """Creates all tables if they don't already exist. Call once on startup."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
@@ -32,6 +32,72 @@ def init_db():
             logged_at TEXT NOT NULL
         )
     """)
+    # Tracks every user who has ever started the bot, so scheduled jobs
+    # (weekly/monthly reports, future alerts) know who to message.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_user_id INTEGER PRIMARY KEY,
+            joined_at TEXT NOT NULL
+        )
+    """)
+    # Per-user, per-alert-type on/off switch. Missing row = enabled by default.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alert_prefs (
+            telegram_user_id INTEGER NOT NULL,
+            alert_type TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            PRIMARY KEY (telegram_user_id, alert_type)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def register_user(user_id: int):
+    """Records that this user has started the bot. Safe to call every /start."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT OR IGNORE INTO users (telegram_user_id, joined_at)
+        VALUES (?, ?)
+    """, (user_id, datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def get_all_user_ids():
+    """Returns every user who has ever started the bot — used by scheduled jobs."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT telegram_user_id FROM users")
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+def is_alert_enabled(user_id: int, alert_type: str) -> bool:
+    """Checks if a given alert type is enabled for a user. Defaults to True if never set."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT enabled FROM alert_prefs WHERE telegram_user_id = ? AND alert_type = ?
+    """, (user_id, alert_type))
+    row = cursor.fetchone()
+    conn.close()
+    if row is None:
+        return True  # default: on
+    return bool(row[0])
+
+
+def set_alert_enabled(user_id: int, alert_type: str, enabled: bool):
+    """Turns a specific alert type on/off for a user."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO alert_prefs (telegram_user_id, alert_type, enabled)
+        VALUES (?, ?, ?)
+        ON CONFLICT(telegram_user_id, alert_type) DO UPDATE SET enabled = excluded.enabled
+    """, (user_id, alert_type, int(enabled)))
     conn.commit()
     conn.close()
 
