@@ -32,6 +32,7 @@ ASK_PAIR, ASK_SESSION, ASK_SETUP, ASK_PLANNED_RR, ASK_CONFIDENCE, ASK_RESULT, AS
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db.register_user(update.effective_user.id)
     await update.message.reply_text(
         "Bot is alive. Your data is private to your Telegram account.\n\n"
         "Commands:\n"
@@ -40,8 +41,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stats — see your all-time performance\n"
         "/weekly — see this week's performance\n"
         "/monthly — see this month's performance\n"
+        "/mute — turn specific automatic messages on/off\n"
         "/cancel — cancel a /log in progress\n"
-        "/ping — check the bot is running"
+        "/ping — check the bot is running\n\n"
+        "You'll also get automatic weekly (Sunday) and monthly reports — "
+        "use /mute anytime to turn those off if you don't want them."
     )
 
 
@@ -237,6 +241,92 @@ async def monthly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_stats(summary, "This month's performance"))
 
 
+# ---------- alert preferences (/mute) ----------
+
+# Every automatic message type the bot can send, and its human-readable name.
+# Add new entries here as future features (news, CRT scans, watchlist) are built —
+# they'll automatically show up in /mute with no other changes needed.
+ALERT_TYPES = [
+    ("weekly_report", "Weekly Report"),
+    ("monthly_report", "Monthly Report"),
+]
+
+
+def mute_keyboard(user_id: int):
+    rows = []
+    for alert_type, label in ALERT_TYPES:
+        enabled = db.is_alert_enabled(user_id, alert_type)
+        status = "🔔 ON" if enabled else "🔕 OFF"
+        rows.append([InlineKeyboardButton(f"{label}: {status}", callback_data=f"mute:{alert_type}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def mute_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Tap to toggle any automatic message on/off:",
+        reply_markup=mute_keyboard(update.effective_user.id)
+    )
+
+
+async def toggle_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    alert_type = query.data.split(":", 1)[1]
+    user_id = query.from_user.id
+    currently_on = db.is_alert_enabled(user_id, alert_type)
+    db.set_alert_enabled(user_id, alert_type, not currently_on)
+    await query.edit_message_text(
+        "Tap to toggle any automatic message on/off:",
+        reply_markup=mute_keyboard(user_id)
+    )
+
+
+# ---------- scheduled jobs (automatic weekly/monthly reports) ----------
+
+async def send_weekly_reports(context: ContextTypes.DEFAULT_TYPE):
+    """Runs every Sunday. Sends each opted-in user their week's performance."""
+    from datetime import datetime, timedelta, timezone
+    since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+
+    for user_id in db.get_all_user_ids():
+        if not db.is_alert_enabled(user_id, "weekly_report"):
+            continue
+        summary = db.get_stats(user_id, since=since)
+        if not summary:
+            continue  # don't message users with nothing to report
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=format_stats(summary, "📊 Your weekly performance")
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send weekly report to {user_id}: {e}")
+
+
+async def send_monthly_reports(context: ContextTypes.DEFAULT_TYPE):
+    """Runs daily, but only actually sends on the 1st of each month (previous month's data)."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    if now.day != 1:
+        return  # only fire on the 1st
+
+    since = (now - timedelta(days=30)).isoformat()
+
+    for user_id in db.get_all_user_ids():
+        if not db.is_alert_enabled(user_id, "monthly_report"):
+            continue
+        summary = db.get_stats(user_id, since=since)
+        if not summary:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=format_stats(summary, "📅 Your monthly performance")
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send monthly report to {user_id}: {e}")
+
+
 def main():
     db.init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -262,6 +352,15 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("weekly", weekly))
     app.add_handler(CommandHandler("monthly", monthly))
+    app.add_handler(CommandHandler("mute", mute_menu))
+    app.add_handler(CallbackQueryHandler(toggle_alert, pattern="^mute:"))
+
+    # Schedule automatic reports.
+    # Times are in UTC — adjust the `time=` values below if you want them
+    # to land at a specific local hour for you.
+    from datetime import time
+    app.job_queue.run_daily(send_weekly_reports, time=time(hour=20, minute=0), days=(6,))  # Sunday
+    app.job_queue.run_daily(send_monthly_reports, time=time(hour=20, minute=5))  # checks for the 1st internally
 
     logger.info("Bot starting...")
     app.run_polling()
