@@ -5,6 +5,7 @@ Phase 2: Trade journal — RR-based logging via guided button flow.
 
 import logging
 import os
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
@@ -29,6 +30,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Minimum seconds between TwelveData API calls, to stay safely under the
+# free tier's 8-calls-per-minute limit. Applied wherever we loop over
+# multiple pairs/timeframes in scan jobs.
+RATE_LIMIT_DELAY = 8
+
+async def fetch_candles_safely(pair, interval, outputsize=60):
+    """
+    Runs the (blocking) TwelveData request in a background thread so it
+    doesn't freeze the bot for other users while waiting, then pauses
+    briefly afterward to respect the API's per-minute rate limit.
+    """
+    candles = await asyncio.to_thread(twelvedata_client.fetch_candles, pair, interval, outputsize)
+    await asyncio.sleep(RATE_LIMIT_DELAY)
+    return candles
+
 # Conversation states for the /log flow
 ASK_PAIR, ASK_SESSION, ASK_SETUP, ASK_PLANNED_RR, ASK_CONFIDENCE, ASK_RESULT, ASK_ACTUAL_RR = range(7)
 
@@ -45,6 +61,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/monthly — see this month's performance\n"
         "/mute — turn specific automatic messages on/off\n"
         "/watchlist — manage pairs you want scanned for setups\n"
+        "/crt — check your watchlist for confirmed CRT setups right now (or /crt PAIR)\n"
         "/cancel — cancel a /log in progress\n"
         "/ping — check the bot is running\n\n"
         "You'll also get automatic weekly (Sunday) and monthly reports — "
@@ -253,7 +270,16 @@ ALERT_TYPES = [
     ("weekly_report", "Weekly Report"),
     ("monthly_report", "Monthly Report"),
     ("watchlist_scan", "Watchlist Opportunity Alerts"),
+    ("crt_scan", "CRT Alerts (BOS confirmed)"),
 ]
+
+# Timeframes checked for CRT, and how TwelveData labels each interval.
+CRT_TIMEFRAMES = {
+    "1W": "1week",
+    "1D": "1day",
+    "4H": "4h",
+    "1H": "1h",
+}
 
 
 def mute_keyboard(user_id: int):
@@ -336,7 +362,7 @@ async def send_monthly_reports(context: ContextTypes.DEFAULT_TYPE):
 async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /watchlist — show your current list
-    /watchlist add PAIR — add a pair
+    /watchlist add PAIR [PAIR2 PAIR3 ...] — add one or more pairs
     /watchlist remove PAIR — remove a pair
     """
     args = context.args
@@ -346,7 +372,7 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pairs = db.get_watchlist(user_id)
         if not pairs:
             await update.message.reply_text(
-                "Your watchlist is empty.\nAdd a pair: /watchlist add EURUSD"
+                "Your watchlist is empty.\nAdd pairs: /watchlist add EUR/USD GBP/USD NDX"
             )
             return
         await update.message.reply_text(
@@ -356,10 +382,16 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     action = args[0].lower()
-    if action == "add" and len(args) == 2:
-        pair = args[1].upper()
-        db.add_to_watchlist(user_id, pair)
-        await update.message.reply_text(f"Added {pair} to your watchlist. Scanned every 4 hours.")
+    if action == "add" and len(args) >= 2:
+        added = []
+        for raw_pair in args[1:]:
+            pair = raw_pair.upper()
+            db.add_to_watchlist(user_id, pair)
+            added.append(pair)
+        await update.message.reply_text(
+            f"Added to your watchlist: {', '.join(added)}\n"
+            f"Watchlist scan every 4h, CRT scan on 1W/1D/4H/1H."
+        )
     elif action == "remove" and len(args) == 2:
         pair = args[1].upper()
         db.remove_from_watchlist(user_id, pair)
@@ -367,7 +399,7 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(
             "Usage:\n/watchlist — show your list\n"
-            "/watchlist add PAIR — e.g. /watchlist add EURUSD\n"
+            "/watchlist add PAIR [PAIR2 PAIR3 ...] — e.g. /watchlist add EUR/USD GBP/USD NDX\n"
             "/watchlist remove PAIR"
         )
 
@@ -383,7 +415,7 @@ async def run_watchlist_scan(context: ContextTypes.DEFAULT_TYPE):
     pairs = db.get_all_watchlist_pairs()
 
     for pair in pairs:
-        candles = twelvedata_client.fetch_candles(pair, interval="4h", outputsize=60)
+        candles = await fetch_candles_safely(pair, interval="4h", outputsize=60)
         if not candles:
             logger.warning(f"Watchlist scan: no data for {pair}")
             continue
@@ -417,6 +449,85 @@ async def run_watchlist_scan(context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Failed to send watchlist alert to {user_id}: {e}")
 
 
+# ---------- CRT: manual command ----------
+
+async def crt_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /crt — check your whole watchlist for confirmed CRT setups right now
+    /crt PAIR — check just one pair
+    Only replies if a confirmed setup is actually found — stays silent otherwise.
+    Runs regardless of your /mute setting, since this is an on-demand check,
+    not an automatic push.
+    """
+    user_id = update.effective_user.id
+    args = context.args
+
+    pairs = [args[0].upper()] if args else db.get_watchlist(user_id)
+    if not pairs:
+        await update.message.reply_text(
+            "Nothing to check. Add a pair to your watchlist first (/watchlist add EURUSD) "
+            "or specify one directly: /crt EURUSD"
+        )
+        return
+
+    lines = []
+    for pair in pairs:
+        for tf_label, tf_interval in CRT_TIMEFRAMES.items():
+            candles = await fetch_candles_safely(pair, interval=tf_interval, outputsize=60)
+            if not candles:
+                continue
+            signal = scanner.detect_crt(candles)
+            if signal:
+                lines.append(f"{pair} ({tf_label}) — {signal}")
+
+    if lines:
+        await update.message.reply_text("\n".join(lines))
+    # else: stay silent, no confirmed setup found
+
+
+# ---------- CRT: scheduled scan ----------
+
+async def run_crt_scan(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Scheduled CRT scan. Which timeframes to check are passed in via
+    context.job.data — daily runs check 1W/1D, 4-hourly runs check 4H/1H.
+    Respects each user's crt_scan mute setting.
+    """
+    timeframes_to_check = context.job.data
+    pairs = db.get_all_watchlist_pairs()
+
+    for pair in pairs:
+        for tf_label in timeframes_to_check:
+            tf_interval = CRT_TIMEFRAMES[tf_label]
+            candles = await fetch_candles_safely(pair, interval=tf_interval, outputsize=60)
+            if not candles:
+                logger.warning(f"CRT scan: no data for {pair} {tf_label}")
+                continue
+
+            signal = scanner.detect_crt(candles)
+            if not signal:
+                continue
+
+            last_candle_time = candles[-1]["datetime"]
+            signal_key = f"crt_{tf_label}"
+            watchers = db.get_users_watching(pair)
+
+            for user_id in watchers:
+                if not db.is_alert_enabled(user_id, "crt_scan"):
+                    continue
+                if db.already_alerted(user_id, pair, signal_key, last_candle_time):
+                    continue
+
+                try:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"👀 CRT confirmed on {pair} ({tf_label}) —\n{signal}"
+                    )
+                    db.mark_alerted(user_id, pair, signal_key, last_candle_time)
+                except Exception as e:
+                    logger.warning(f"Failed to send CRT alert to {user_id}: {e}")
+
+
 def main():
     db.init_db()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -445,6 +556,7 @@ def main():
     app.add_handler(CommandHandler("mute", mute_menu))
     app.add_handler(CallbackQueryHandler(toggle_alert, pattern="^mute:"))
     app.add_handler(CommandHandler("watchlist", watchlist_command))
+    app.add_handler(CommandHandler("crt", crt_check))
 
     # Schedule automatic reports.
     # Times are in UTC — adjust the `time=` values below if you want them
@@ -457,6 +569,12 @@ def main():
     # there and repeats every 4 hours: 22:00, 02:00, 06:00, 10:00, 14:00, 18:00 UTC.
     for hour in (22, 2, 6, 10, 14, 18):
         app.job_queue.run_daily(run_watchlist_scan, time=time(hour=hour, minute=1))
+        # CRT on the fast timeframes runs on the same 4-hourly schedule.
+        app.job_queue.run_daily(run_crt_scan, time=time(hour=hour, minute=3), data=["4H", "1H"])
+    # CRT on 1W/1D only needs checking once a day — no point checking a
+    # weekly candle every 4 hours, it hasn't changed.
+    # 10:50pm in Nigeria (WAT, UTC+1) = 21:50 UTC.
+    app.job_queue.run_daily(run_crt_scan, time=time(hour=21, minute=50), data=["1W", "1D"])
 
     logger.info("Bot starting...")
     app.run_polling()
